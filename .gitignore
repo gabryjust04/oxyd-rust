@@ -1,0 +1,81 @@
+# ========================================
+# Rust / Cargo
+# ========================================
+/target/
+/Cargo.lock        # se è una lib workspace, lo puoi committare se vuoi stabilità
+**/*.rs.bk
+**/*.rmeta
+
+# Build & profiling artifacts
+*.profraw
+*.profdata
+*.dSYM/
+*.pdb
+*.obj
+
+# ========================================
+# Editor / IDE
+# ========================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ========================================
+# Logs & runtime
+# ========================================
+*.log
+*.tmp
+/tmp/
+.logs/
+.env
+.env.local
+.env.development
+.env.production
+.env.test
+
+# ========================================
+# SQLx / Database
+# ========================================
+# SQLx offline data (autogenerata da `cargo sqlx prepare`)
+sqlx-data.json
+
+# Backup / migrations temp
+migrations/**/down.sql~
+migrations/**/up.sql~
+
+# ========================================
+# Web / Frontend (Next.js o simile)
+# ========================================
+web-admin/.next/
+web-admin/node_modules/
+web-admin/.turbo/
+web-admin/.vercel/
+web-admin/out/
+web-admin/dist/
+web-admin/build/
+web-admin/.env*
+web-admin/coverage/
+web-admin/npm-debug.log*
+web-admin/yarn-debug.log*
+web-admin/yarn-error.log*
+
+# ========================================
+# Other tools / scripts
+# ========================================
+/dist/
+/build/
+/coverage/
+*.sqlite
+*.db
+*.bak
+
+# ========================================
+# OS / Misc
+# ========================================
+*.lock
+*.orig
+*.rej
