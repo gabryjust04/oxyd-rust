@@ -1,10 +1,18 @@
 # ========================================
 # Rust / Cargo
 # ========================================
-/target/
-/Cargo.lock        # se è una lib workspace, lo puoi committare se vuoi stabilità
+target/
+/target
+/Cargo.lock       
 **/*.rs.bk
 **/*.rmeta
+**/*.rs.bk
+**/target/
+**/*.rs.bk
+Cargo.lock
+rustfmt.toml
+.rustc_info.json
+
 
 # Build & profiling artifacts
 *.profraw

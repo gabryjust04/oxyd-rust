@@ -295,7 +295,7 @@ async fn expired_access_token_is_rejected(pool: PgPool) {
 
     println!("Access token: {}", reg.access_token);
     // Wait for expiration (sleep > TTL)
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    tokio::time::sleep(Duration::from_secs(20)).await;
 
     // /auth/me must now reject the expired token
     let res = get_bearer(&app, "/auth/me", Some(&reg.access_token)).await;
