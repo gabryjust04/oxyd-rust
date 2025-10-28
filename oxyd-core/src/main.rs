@@ -1,5 +1,6 @@
 mod auth;
 mod general;
+mod virtual_crud;
 use axum::Router;
 use dotenvy::dotenv;
 use sqlx::postgres::PgPoolOptions;
@@ -35,9 +36,11 @@ async fn main() -> anyhow::Result<()> {
 
     let state = AppState::new(pool, jwt_secret, access_ttl, refresh_ttl);
 
-    // Monta SOLO il router di auth (login/register/refresh/me)
+    // Monta  il router di auth (login/register/refresh/me) e virtual crud
     // Se la tua funzione costruisce già il Router con lo state, tieni così:
-    let app: Router = auth::routes::router(state);
+    let app: Router = auth::routes::router(state.clone())
+        .merge(virtual_crud::routes::router(state.clone()));
+
 
     // In alternativa, se la tua `router()` non prende lo state:
     // let app: Router = auth::routes::router().with_state(state);

@@ -1,5 +1,4 @@
 pub mod types;
-pub mod errors;
 pub mod service;
 pub mod middleware;
 pub mod extractors;

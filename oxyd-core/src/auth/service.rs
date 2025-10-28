@@ -14,8 +14,9 @@
 //! - Refresh rotation: using a valid refresh revokes it and issues a new one.
 //! - JWT claims kept minimal (sub/iat/exp). Add iss/aud if your system requires it.
 
-use crate::auth::{errors::{ApiError, ApiResult}, types::*};
+use crate::auth::{ types::*};
 use crate::general::types::AppState;
+use crate::general::errors::*;
 
 use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},

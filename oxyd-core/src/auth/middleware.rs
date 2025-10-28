@@ -7,9 +7,10 @@ use axum::{
 };
 // jsonwebtoken is used to decode and validate JWTs
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
-use crate::auth::{types::{ CurrentUser, JwtClaims}, errors::ApiError};
+use crate::auth::{types::{ CurrentUser, JwtClaims}};
 use sqlx::Row;
 use crate::general::types::AppState;
+use crate::general::errors::ApiError;
 
 /// Middleware that authenticates requests using a Bearer JWT.
 ///

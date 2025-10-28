@@ -4,12 +4,12 @@ use axum::{
 };
 
 use crate::auth::{
-    errors::ApiError,
     types::{CurrentUser, JwtClaims},
 };
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use sqlx::Row;
 use crate::general::types::AppState;
+use crate::general::errors::ApiError;
 
 /// REQUIRED extraction: the route fails with 401 if the user is not authenticated.
 ///

@@ -47,7 +47,7 @@ thiserror = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 anyhow = "1.0"
 hex = "0.4"
-
+regex = "1.12.2"
 
 
 # logging

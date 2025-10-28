@@ -1,3 +1,5 @@
+// oxyd-core/src/general/errors.rs
+
 use axum::http::StatusCode;
 
 /// A convenience alias used throughout handlers/services:
