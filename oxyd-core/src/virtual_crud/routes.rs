@@ -1,18 +1,20 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, Query, State},
-    routing::get,
-    Json, Router,
+    Extension, Json, Router, extract::{Path, Query, State}, routing::get
 };
 use serde_json::Value;
 use axum::http::StatusCode;
+use sha2::digest::crypto_common::IvSizeUser;
 
-use crate::general::errors::{ApiError, ApiResult};
+use crate::{auth::types::CurrentUser, general::errors::{ApiError, ApiResult}};
 use crate::general::types::AppState; // assume che contenga `pub db: PgPool`
 
-use super::services::{ensure_exposed, parse_query_options, select_rows};
+use super::query::{parse_query_options};
+use super::select::select_rows;
+use super::registry::{ensure_exposed};
 use super::types::QueryOptions;
+use crate::auth::extractors::OptionalUser;
 
 /// Monta le rotte del CRUD virtuale (solo SELECT).
 /// Esempi:
@@ -33,18 +35,26 @@ async fn list_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
     Query(qs): Query<HashMap<String, String>>,
+    OptionalUser(user): OptionalUser,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let require_auth = ensure_exposed(&state, &table)
         .await
-        .map_err(|e| e.into_response())?; // oppure mappa qui a (StatusCode, String)
+        .map_err(|e| e.into_response())?;
+
+    // Ora puoi verificare se l'auth è richiesta e se l'utente è presente
+    if require_auth && user.is_none() {
+        return Err((StatusCode::UNAUTHORIZED, "Authentication required".to_string()));
+    }
 
     let schema = "public";
     let opts: QueryOptions = parse_query_options(&qs)
         .map_err(|e| e.into_response())?;
 
-    let data = select_rows(&state, schema, &table, &opts)
+    let data = select_rows(&state, schema, &table, &opts,user)
         .await
         .map_err(|e| e.into_response())?;
 
     Ok(Json(data))
 }
+
+
