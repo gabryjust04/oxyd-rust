@@ -99,49 +99,77 @@ pub async fn select_rows(
     opts: &QueryOptions,
     user: Option<CurrentUser>,
 ) -> ApiResult<Value> {
-    
     if let Some(ref cu) = user {
         println!("select_rows called with authenticated user id={}", cu.id);
     } else {
         println!("select_rows called without authenticated user");
     }
 
-    let pool = &state.pool;
     let meta = registry::load_table_meta(state, schema, table).await?;
-
     let (sql, binds) = build_select_sql(&meta, opts)?;
+
+    // ── RLS: transazione + SET LOCAL del contesto utente ────────────────────────
+    let mut tx = state.pool.begin().await?;
+
+    if let Some(ref cu) = user {
+        // Variabile di sessione per le policy RLS (testo). Verrà letta con current_setting(...)
+        // NOTA: niente ELSE per gli anonimi: SET LOCAL si "smonta" a fine transazione.
+        sqlx::query(
+            "SELECT set_config('app.current_user_id', $1, true)"
+        )
+        // normalizziamo a stringa; lato policy farai:
+        // current_setting('app.current_user_id', true)::int / ::uuid ecc.
+        .bind(cu.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| {
+            error!(error=%e, "failed to set RLS context via set_config");
+            ApiError::Internal("failed to set RLS context".into())
+        })?;
+    }
+
 
     let mut q = sqlx::query(&sql);
     for b in &binds {
         q = q.bind(b.as_str());
     }
 
-    let rows = match q.fetch_all(pool).await {
+    let rows = match q.fetch_all(&mut *tx).await {
         Ok(rows) => rows,
         Err(e) => {
             use sqlx::Error;
             if let Error::Database(db_err) = &e {
-                let code_opt = db_err.code();
-                let code = code_opt.as_deref().unwrap_or("");
+                let code_cow = db_err.code();
+                let code = code_cow.as_deref().unwrap_or("");
                 let msg = db_err.message();
                 match code {
                     "22P02" | "22007" | "42804" | "42846" | "42883" => {
-                        return Err(ApiError::BadRequest(msg.to_string()))
+                        // cast/parse error, operator mismatch, ecc.
+                        tx.rollback().await.ok();
+                        return Err(ApiError::BadRequest(msg.to_string()));
                     }
-                    "42703" => return Err(ApiError::BadRequest(format!("unknown column/expression: {}", msg))),
+                    "42703" => {
+                        tx.rollback().await.ok();
+                        return Err(ApiError::BadRequest(format!("unknown column/expression: {}", msg)));
+                    }
                     "42P01" => {
-                        return Err(ApiError::NotFound(format!(r#"table "{}"."{}" not found"#, schema, table)))
+                        tx.rollback().await.ok();
+                        return Err(ApiError::NotFound(format!(r#"table "{}"."{}" not found"#, schema, table)));
                     }
                     _ => {
                         error!(%code, db_message=%msg, sql=%sql, ?binds, "unhandled database error");
+                        tx.rollback().await.ok();
                         return Err(ApiError::Internal("database error".into()));
                     }
                 }
             }
             error!(error=%e, sql=%sql, ?binds, "non-database error");
+            tx.rollback().await.ok();
             return Err(ApiError::Internal("internal error".into()));
         }
     };
+
+    tx.commit().await?;
 
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
