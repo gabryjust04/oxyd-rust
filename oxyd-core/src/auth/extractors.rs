@@ -70,7 +70,7 @@ impl FromRequestParts<AppState> for RequireUser {
 
         // Load user email from DB and verify the user is active.
         // If DB fails -> Internal, if user not found -> Unauthorized.
-        let row = sqlx::query("SELECT email FROM users WHERE id = $1 AND is_active = TRUE")
+        let row = sqlx::query("SELECT email FROM oxyd_auth.users WHERE id = $1 AND is_active = TRUE")
             .bind(user_id)
             .fetch_optional(&state.pool)
             .await
@@ -112,7 +112,7 @@ impl FromRequestParts<AppState> for OptionalUser {
         };
 
         // Try to fetch the user's email. Any DB error or missing user -> return None.
-        let row = match sqlx::query("SELECT email FROM users WHERE id = $1 AND is_active = TRUE")
+        let row = match sqlx::query("SELECT email FROM oxyd_auth.users WHERE id = $1 AND is_active = TRUE")
             .bind(user_id)
             .fetch_optional(&state.pool)
             .await

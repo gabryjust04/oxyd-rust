@@ -9,14 +9,14 @@ use crate::general::types::AppState;
 
 
 
-/// Controlla se esiste la tabella di registry `_oxyd_tables`.
+/// Controlla se esiste la tabella di registry `oxyd_internal._oxyd_tables`.
 async fn oxyd_tables_exists(state: &AppState) -> Result<bool, sqlx::Error> {
     let pool = &state.pool;
     let exists: Option<bool> = sqlx::query_scalar(
         r#"
         SELECT TRUE
         FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_name = '_oxyd_tables'
+        WHERE table_schema = 'oxyd_internal' AND table_name = '_oxyd_tables'
         LIMIT 1
         "#,
     )
@@ -25,7 +25,7 @@ async fn oxyd_tables_exists(state: &AppState) -> Result<bool, sqlx::Error> {
     Ok(exists.unwrap_or(false))
 }
 
-/// Carica la config dalla `_oxyd_tables`.
+/// Carica la config dalla `oxyd_internal._oxyd_tables`.
 /// Se la tabella registry non esiste → Ok(None) (ambiente dev: tutto esposto).
 pub async fn load_table_config(state: &AppState, table: &str) -> ApiResult<Option<OxydTableConfig>> {
     if !oxyd_tables_exists(state).await.map_err(ApiError::from)? {
@@ -35,7 +35,7 @@ pub async fn load_table_config(state: &AppState, table: &str) -> ApiResult<Optio
     let row = sqlx::query(
         r#"
         SELECT table_name, is_exposed, require_auth, allow_insert, allow_update, allow_delete, description
-        FROM _oxyd_tables
+        FROM oxyd_internal._oxyd_tables
         WHERE table_name = $1
         "#,
     )
@@ -135,7 +135,7 @@ pub async fn load_table_meta(state: &AppState, schema: &str, table: &str) -> Api
     })
 }
 
-/// Verifica esposizione della tabella usando `_oxyd_tables`.
+/// Verifica esposizione della tabella usando `oxyd_internal._oxyd_tables`.
 /// - Se registry NON esiste → consenti.
 /// - Se esiste e la tabella non è registrata o non esposta → NotFound.
 /// - Ritorna anche il flag `require_auth` per far decidere al caller.

@@ -1,36 +1,55 @@
+// oxyd-core/src/virtual_crud/routes.rs
+
 use std::collections::HashMap;
 
 use axum::{
-    Extension, Json, Router, extract::{Path, Query, State}, routing::get
+    extract::{Path, Query, State},
+    http::StatusCode,
+    routing::{get, post},
+    Extension,
+    Json,
+    Router,
 };
 use serde_json::Value;
-use axum::http::StatusCode;
-use sha2::digest::crypto_common::IvSizeUser;
 
-use crate::{auth::types::CurrentUser, general::errors::{ApiError, ApiResult}};
-use crate::general::types::AppState; // assume che contenga `pub db: PgPool`
+use crate::{
+    auth::{
+        extractors::OptionalUser,
+        types::CurrentUser,
+    },
+    general::{
+        errors::{ApiError, ApiResult},
+        types::AppState,
+    },
+};
 
-use super::query::{parse_query_options};
+use super::query::parse_query_options;
+use super::registry::ensure_exposed;
 use super::select::select_rows;
-use super::registry::{ensure_exposed};
 use super::types::QueryOptions;
-use crate::auth::extractors::OptionalUser;
+use super::insert::insert_rows;
 
-/// Monta le rotte del CRUD virtuale (solo SELECT).
+/// Monta le rotte del CRUD virtuale (SELECT + INSERT).
+///
 /// Esempi:
-///   GET /api/posts
-///   GET /api/posts?select=id,title&order=created_at.desc&limit=50
-///   GET /api/posts?id=eq.42
+///   GET  /api/posts
+///   GET  /api/posts?select=id,title&order=created_at.desc&limit=50
+///   GET  /api/posts?id=eq.42
+///   POST /api/posts   (body JSON singolo o array per bulk insert)
 pub fn router(state: AppState) -> Router {
-    Router::new().route("/api/{table}", get(list_handler).with_state(state.clone()))
+    Router::new()
+        .route(
+            "/api/{table}",
+            get(list_handler).post(insert_handler),
+        )
+        .with_state(state)
 }
 
 /// Handler lista/selezione righe.
+///
 /// - legge sempre i metadati al volo
 /// - verifica esposizione via `_oxyd_tables` (se presente)
-/// - (nota) se `require_auth = true`, qui NON forziamo auth: lascia la responsabilità
-///         a un middleware `RequireUser` montato su questa rotta o ad un guard esterno.
-///         In alternativa, puoi leggere l'utente dalle extensions e restituire 401 qui.
+/// - se `require_auth = true` e `user` è None → 401
 async fn list_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
@@ -41,20 +60,54 @@ async fn list_handler(
         .await
         .map_err(|e| e.into_response())?;
 
-    // Ora puoi verificare se l'auth è richiesta e se l'utente è presente
     if require_auth && user.is_none() {
-        return Err((StatusCode::UNAUTHORIZED, "Authentication required".to_string()));
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Authentication required".to_string(),
+        ));
     }
 
     let schema = "public";
     let opts: QueryOptions = parse_query_options(&qs)
         .map_err(|e| e.into_response())?;
 
-    let data = select_rows(&state, schema, &table, &opts,user)
+    let data = select_rows(&state, schema, &table, &opts, user)
         .await
         .map_err(|e| e.into_response())?;
 
     Ok(Json(data))
 }
 
+/// Handler insert (singolo o bulk).
+///
+/// - body = { ... }              → singolo insert
+/// - body = [ {...}, {...} ]     → bulk insert
+/// - delega a `insert_rows`, che:
+///   - costruisce la INSERT dinamica
+///   - setta il contesto RLS via `set_config('app.current_user_id', $1, true)`
+///   - ritorna le righe inserite come array JSON
+async fn insert_handler(
+    State(state): State<AppState>,
+    Path(table): Path<String>,
+    OptionalUser(user): OptionalUser,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>, (StatusCode, String)> {
+    let require_auth = ensure_exposed(&state, &table)
+        .await
+        .map_err(|e| e.into_response())?;
 
+    if require_auth && user.is_none() {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "Authentication required".to_string(),
+        ));
+    }
+
+    let schema = "public";
+
+    let data = insert_rows(&state, schema, &table, &body, user)
+        .await
+        .map_err(|e| e.into_response())?;
+
+    Ok(Json(data))
+}

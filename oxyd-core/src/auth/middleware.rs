@@ -76,7 +76,7 @@ pub async fn auth_middleware(
 
     // Load minimal user info from the database to ensure user exists and is active.
     // We use `fetch_optional` so we can return a 401 if the row is not found.
-    let row = sqlx::query("SELECT email FROM users WHERE id = $1 AND is_active = TRUE")
+    let row = sqlx::query("SELECT email FROM oxyd_auth.users WHERE id = $1 AND is_active = TRUE")
         .bind(user_id)
         .fetch_optional(&state.pool)
         .await

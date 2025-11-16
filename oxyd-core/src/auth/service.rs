@@ -65,7 +65,7 @@ pub async fn register(state: &AppState, email: &str, password: &str) -> ApiResul
     // Try to insert the user; ON CONFLICT ensures we don't leak whether the email exists
     // beyond returning a generic conflict error.
     let res = sqlx::query_as::<_, UserRow>(
-        "INSERT INTO users (email, password_hash)
+        "INSERT INTO oxyd_auth.users (email, password_hash)
          VALUES ($1, $2)
          ON CONFLICT (email) DO NOTHING
          RETURNING id, email, password_hash, is_active",
@@ -86,7 +86,7 @@ pub async fn register(state: &AppState, email: &str, password: &str) -> ApiResul
 
     // Persist only the *hash* of the refresh token with its expiry.
     sqlx::query(
-        "INSERT INTO refresh_sessions (user_id, token_hash, expires_at)
+        "INSERT INTO oxyd_auth.refresh_sessions (user_id, token_hash, expires_at)
          VALUES ($1, $2, $3)",
     )
     .bind(user.id)
@@ -111,7 +111,7 @@ pub async fn register(state: &AppState, email: &str, password: &str) -> ApiResul
 pub async fn login(state: &AppState, email: &str, password: &str) -> ApiResult<AuthResponse> {
     // Fetch by email; don't reveal whether the email exists on failure.
     let user = sqlx::query_as::<_, UserRow>(
-        "SELECT id, email, password_hash, is_active FROM users WHERE email = $1",
+        "SELECT id, email, password_hash, is_active FROM oxyd_auth.users WHERE email = $1",
     )
     .bind(email)
     .fetch_optional(&state.pool)
@@ -133,7 +133,7 @@ pub async fn login(state: &AppState, email: &str, password: &str) -> ApiResult<A
     let (refresh_token, token_hash) = generate_refresh(&state.refresh_ttl);
 
     sqlx::query(
-        "INSERT INTO refresh_sessions (user_id, token_hash, expires_at)
+        "INSERT INTO oxyd_auth.refresh_sessions (user_id, token_hash, expires_at)
          VALUES ($1, $2, $3)",
     )
     .bind(user.id)
@@ -168,7 +168,7 @@ pub async fn refresh(state: &AppState, presented_refresh: &str) -> ApiResult<Aut
     // Look up an active, non-revoked, non-expired session for this hash.
     let sess = sqlx::query_as::<_, SessRow>(
         "SELECT id, user_id
-         FROM refresh_sessions
+         FROM oxyd_auth.refresh_sessions
          WHERE token_hash = $1
            AND revoked = FALSE
            AND expires_at > NOW()",
@@ -186,13 +186,13 @@ pub async fn refresh(state: &AppState, presented_refresh: &str) -> ApiResult<Aut
     // 2) insert the new session (linking via replaced_by for auditability)
     let mut tx = state.pool.begin().await?;
 
-    sqlx::query("UPDATE refresh_sessions SET revoked = TRUE WHERE id = $1")
+    sqlx::query("UPDATE oxyd_auth.refresh_sessions SET revoked = TRUE WHERE id = $1")
         .bind(sess.id)
         .execute(&mut *tx)
         .await?;
 
     let new_id: i64 = sqlx::query(
-        "INSERT INTO refresh_sessions (user_id, token_hash, expires_at)
+        "INSERT INTO oxyd_auth.refresh_sessions (user_id, token_hash, expires_at)
          VALUES ($1, $2, $3)
          RETURNING id",
     )
@@ -203,7 +203,7 @@ pub async fn refresh(state: &AppState, presented_refresh: &str) -> ApiResult<Aut
     .await?
     .get(0);
 
-    sqlx::query("UPDATE refresh_sessions SET replaced_by = $1 WHERE id = $2")
+    sqlx::query("UPDATE oxyd_auth.refresh_sessions SET replaced_by = $1 WHERE id = $2")
         .bind(new_id)
         .bind(sess.id)
         .execute(&mut *tx)
@@ -226,7 +226,7 @@ pub async fn refresh(state: &AppState, presented_refresh: &str) -> ApiResult<Aut
 
 /// Load the public shape of a user (id/email) ensuring the account is active.
 pub async fn load_public_user(user_id: i64, state: &AppState) -> ApiResult<PublicUser> {
-    let row = sqlx::query("SELECT id, email FROM users WHERE id = $1 AND is_active = TRUE")
+    let row = sqlx::query("SELECT id, email FROM oxyd_auth.users WHERE id = $1 AND is_active = TRUE")
         .bind(user_id)
         .fetch_one(&state.pool)
         .await?;
@@ -235,7 +235,7 @@ pub async fn load_public_user(user_id: i64, state: &AppState) -> ApiResult<Publi
 
 /// Load only the email for a given user id (no active check).
 async fn load_email(user_id: i64, state: &AppState) -> ApiResult<String> {
-    let row = sqlx::query("SELECT email FROM users WHERE id = $1")
+    let row = sqlx::query("SELECT email FROM oxyd_auth.users WHERE id = $1")
         .bind(user_id)
         .fetch_one(&state.pool)
         .await?;
