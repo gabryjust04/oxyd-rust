@@ -7,7 +7,9 @@ use sqlx::postgres::PgPoolOptions;
 use std::{time::Duration};
 use tokio::net::TcpListener;
 
+
 use crate::general::types::AppState;
+use crate::virtual_crud::registry::RegistryCache;
 
 
 #[tokio::main]
@@ -34,7 +36,9 @@ async fn main() -> anyhow::Result<()> {
         .connect(&database_url)
         .await?;
 
-    let state = AppState::new(pool, jwt_secret, access_ttl, refresh_ttl);
+    let registry_cache = RegistryCache::new();
+
+    let state = AppState::new(pool, jwt_secret, access_ttl, refresh_ttl, registry_cache);
 
     // Monta  il router di auth (login/register/refresh/me) e virtual crud
     // Se la tua funzione costruisce già il Router con lo state, tieni così:

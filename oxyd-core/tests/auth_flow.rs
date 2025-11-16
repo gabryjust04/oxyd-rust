@@ -28,6 +28,7 @@ use serde::Deserialize;
 use sqlx::PgPool;
 use std::{sync::Arc, time::Duration};
 use tower::ServiceExt;
+use app::virtual_crud::registry::RegistryCache;
 
 
 
@@ -48,7 +49,7 @@ struct AuthResponse {
 
 fn build_app_with_ttls(pool: PgPool, access_ttl: Duration, refresh_ttl: Duration) -> Router {
     let secret: Arc<[u8]> = Arc::from(b"segreto".to_vec().into_boxed_slice());
-    let state = app::general::types::AppState::new(pool, secret, access_ttl, refresh_ttl);
+    let state = app::general::types::AppState::new(pool, secret, access_ttl, refresh_ttl, RegistryCache::new());
     app::auth::routes::router(state)
 }
 

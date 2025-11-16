@@ -49,6 +49,9 @@ anyhow = "1.0"
 hex = "0.4"
 regex = "1.12.2"
 
+# cache
+moka = {version = "0.12.11", features = ["future"]}
+
 
 # logging
 tracing = "0.1"
