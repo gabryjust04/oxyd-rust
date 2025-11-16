@@ -21,7 +21,12 @@ use crate::{
 /// - body = [ {...}, {...} ]     → bulk insert
 /// - colonne = unione delle chiavi; per chiavi mancanti in una riga → DEFAULT
 /// - valori null → NULL; altrimenti bind con cast ::tipo
-/// - RLS: se user è presente, setta il contesto app.current_user_id via set_config(..., true)
+///
+/// Sicurezza multi-tenant:
+/// - se user è presente:
+///   - setta app.current_user_id via set_config(..., true) all'interno della transazione
+///   - se la tabella ha colonna `user_id`, il backend la forza SEMPRE a `user.id`
+///     ignorando ciò che arriva dal client (e se prova a metterla diversa → 400).
 pub async fn insert_rows(
     state: &AppState,
     schema: &str,
@@ -43,6 +48,10 @@ pub async fn insert_rows(
     for c in &meta.columns {
         coltypes.insert(c.name.as_str(), c.data_type.as_str());
     }
+
+    // se la tabella è "user-owned" avrà una colonna `user_id`
+    let has_user_id = colset.contains("user_id");
+    let user_is_authenticated = user.is_some();
 
     // normalizza input in Vec<Map>
     let rows_in: Vec<&serde_json::Map<String, Value>> = match body {
@@ -67,7 +76,7 @@ pub async fn insert_rows(
         }
     };
 
-    // unione delle colonne
+    // unione delle colonne presenti nell'input
     let all_cols: Vec<String> = {
         let mut set = HashSet::<String>::new();
         for m in &rows_in {
@@ -79,6 +88,13 @@ pub async fn insert_rows(
                 set.insert(k.to_string());
             }
         }
+
+        // Convenzione: se la tabella ha `user_id` e c'è un utente autenticato,
+        // lo gestisce SEMPRE il backend.
+        if has_user_id && user_is_authenticated {
+            set.insert("user_id".to_string());
+        }
+
         let mut v: Vec<String> = set.into_iter().collect();
         v.sort(); // ordine deterministico
         v
@@ -87,6 +103,11 @@ pub async fn insert_rows(
     // Costruzione SQL + binds (senza ancora eseguire nulla)
     let (sql, binds): (String, Vec<String>) = if all_cols.is_empty() {
         // nessuna colonna → INSERT DEFAULT VALUES
+        //
+        // Nota:
+        // - se la tabella ha user_id NOT NULL senza DEFAULT, questo fallirà lato DB
+        //   (puoi aggiungere un DEFAULT a livello Postgres se vuoi supportare
+        //   anche questo caso).
         let sql = format!(
             r#"
             WITH ins AS (
@@ -110,13 +131,47 @@ pub async fn insert_rows(
         }
 
         // VALUES (...), (...), ...
-        let mut binds: Vec<String> = Vec::new();
+        let mut binds: Vec<String> = Vec::with_capacity(rows_in.len() * all_cols.len());
         let mut values_rows: Vec<String> = Vec::with_capacity(rows_in.len());
 
         for m in &rows_in {
             let mut tuple_parts: Vec<String> = Vec::with_capacity(all_cols.len());
+
             for (idx, col) in all_cols.iter().enumerate() {
                 let cast = casts[idx];
+
+                // Gestione speciale per `user_id`:
+                // - se la tabella ha user_id e c'è un CurrentUser:
+                //   - se il client lo passa e non coincide con cu.id → 400
+                //   - in ogni caso, in INSERT usiamo SEMPRE cu.id
+                if has_user_id && user_is_authenticated && col == "user_id" {
+                    let cu = user.as_ref().unwrap();
+
+                    if let Some(v) = m.get(col) {
+                        // se il client prova a mettere user_id esplicito diverso dal proprio → errore chiaro
+                        if !v.is_null() {
+                            let client_val = if v.is_string() {
+                                v.as_str().unwrap().to_string()
+                            } else {
+                                v.to_string()
+                            };
+                            let expected = cu.id.to_string();
+                            if client_val != expected {
+                                return Err(ApiError::BadRequest(
+                                    "cannot override user_id; it is bound to the authenticated user"
+                                        .into(),
+                                ));
+                            }
+                        }
+                    }
+
+                    // forziamo SEMPRE user_id = cu.id
+                    binds.push(cu.id.to_string());
+                    tuple_parts.push(format!("${}::{}", binds.len(), cast));
+                    continue;
+                }
+
+                // comportamento standard per tutte le altre colonne
                 match m.get(col) {
                     None => {
                         // colonna assente in questa riga → DEFAULT
@@ -138,6 +193,7 @@ pub async fn insert_rows(
                     }
                 }
             }
+
             values_rows.push(format!("({})", tuple_parts.join(", ")));
         }
 
@@ -221,7 +277,10 @@ pub async fn insert_rows(
                             "unhandled database error (insert)"
                         );
                         tx.rollback().await.ok();
-                        println!("Unhandled database error (insert): code={}, message={}", code, msg);
+                        println!(
+                            "Unhandled database error (insert): code={}, message={}",
+                            code, msg
+                        );
                         return Err(ApiError::Internal("database error".into()));
                     }
                 }
