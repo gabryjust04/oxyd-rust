@@ -15,15 +15,19 @@ use crate::{
 
 use super::types::*;
 
-/// Esegue DELETE e ritorna le righe eliminate come array JSON.
+/// Execute a filtered DELETE and return the deleted rows as a JSON array.
 ///
-/// - Richiede almeno un filtro (evita mass delete).
-/// - Usa le policy RLS definite sul DB:
-///   - se `user` è presente:
-///       - apre una transazione
-///       - esegue `set_config('app.current_user_id', user.id, true)`
-///       - esegue la DELETE all'interno della stessa transazione
-///   - le policy RLS decidono quali righe sono effettivamente cancellabili.
+/// Behaviour:
+/// - Requires at least one filter in `QueryOptions`:
+///     - this explicitly disallows "DELETE everything" without a WHERE clause.
+/// - Relies on database-side RLS policies:
+///   - If `user` is present:
+///       - opens a transaction,
+///       - runs `set_config('app.current_user_id', user.id, true)` inside it,
+///       - performs the DELETE within the same transaction.
+///   - RLS policies decide which rows are actually deletable for that user.
+/// - Deleted rows are returned as `row_to_json` objects in a JSON array
+///   (PostgREST-style response).
 pub async fn delete_rows(
     state: &AppState,
     schema: &str,
@@ -31,14 +35,17 @@ pub async fn delete_rows(
     opts: &QueryOptions,
     user: Option<CurrentUser>,
 ) -> ApiResult<Value> {
+    // Load table metadata (columns, types, etc.).
     let meta = registry::load_table_meta(state, schema, table).await?;
 
+    // Safety guard: never allow a DELETE without filters.
     if opts.filters.is_empty() {
         return Err(ApiError::BadRequest(
             "refuse DELETE without filters".into(),
         ));
     }
 
+    // Small debug log to see if RLS context will be set.
     if let Some(ref cu) = user {
         println!(
             r#"delete_rows called with authenticated user id={}"#,
@@ -48,10 +55,21 @@ pub async fn delete_rows(
         println!("delete_rows called without authenticated user");
     }
 
-    // Costruzione WHERE + bind
+    // ── Build WHERE clause + bind values ──────────────────────────────────────
+    //
+    // `build_where_sql` validates columns, types, and operators and pushes
+    // all filter values into `binds` in the proper order.
     let mut binds: Vec<String> = Vec::new();
     let where_sql = query::build_where_sql(&meta, opts, &mut binds)?;
 
+    // Final SQL shape:
+    //
+    // WITH deleted AS (
+    //   DELETE FROM "schema"."table"
+    //   WHERE ...
+    //   RETURNING *
+    // )
+    // SELECT row_to_json(deleted) AS data FROM deleted;
     let sql = format!(
         r#"
         WITH deleted AS (
@@ -59,18 +77,21 @@ pub async fn delete_rows(
             {where_sql}
             RETURNING *
         )
-        SELECT row_to_json(deleted) AS data FROM deleted
+        SELECT row_to_json(deleted) AS data
+        FROM deleted
         "#,
         schema = meta.schema,
         table = meta.name,
         where_sql = where_sql,
     );
 
-    // ── RLS: transazione + set_config del contesto utente ───────────────────────
+    // ── RLS: transaction + set_config for user context ────────────────────────
     let mut tx = state.pool.begin().await?;
 
     if let Some(ref cu) = user {
-        // set_config(..., true) = "SET LOCAL", limitato alla transazione
+        // `set_config(..., true)` behaves like `SET LOCAL`:
+        // - it is scoped to the current transaction only,
+        // - it supports bind parameters.
         sqlx::query("SELECT set_config('app.current_user_id', $1, true)")
             .bind(cu.id.to_string())
             .execute(&mut *tx)
@@ -84,11 +105,13 @@ pub async fn delete_rows(
             })?;
     }
 
+    // Bind all filter values into the DELETE query.
     let mut q = sqlx::query(&sql);
     for b in &binds {
         q = q.bind(b.as_str());
     }
 
+    // ── Execute DELETE and map errors to API-level responses ──────────────────
     let rows = match q.fetch_all(&mut *tx).await {
         Ok(rows) => rows,
         Err(e) => {
@@ -100,12 +123,12 @@ pub async fn delete_rows(
                 let msg = db_err.message();
 
                 match code {
-                    // errori di tipo/cast/funzione
+                    // Type / cast / function errors (bad input, type mismatch, etc.).
                     "22P02" | "22007" | "42804" | "42846" | "42883" => {
                         tx.rollback().await.ok();
                         return Err(ApiError::BadRequest(msg.to_string()));
                     }
-                    // colonna o espressione sconosciuta
+                    // Unknown column or expression in the query.
                     "42703" => {
                         tx.rollback().await.ok();
                         return Err(ApiError::BadRequest(format!(
@@ -113,7 +136,7 @@ pub async fn delete_rows(
                             msg
                         )));
                     }
-                    // tabella non esiste
+                    // Target table not found.
                     "42P01" => {
                         tx.rollback().await.ok();
                         return Err(ApiError::NotFound(format!(
@@ -121,6 +144,7 @@ pub async fn delete_rows(
                             schema, table
                         )));
                     }
+                    // Any other database error: log and return a generic 500.
                     _ => {
                         error!(
                             %code,
@@ -135,14 +159,18 @@ pub async fn delete_rows(
                 }
             }
 
+            // Non-database errors (pool issues, IO, etc.).
             error!(error = %e, sql=%sql, ?binds, "non-database error (delete)");
             tx.rollback().await.ok();
             return Err(ApiError::Internal("internal error".into()));
         }
     };
 
+    // If we reach this point, the DELETE succeeded. Commit the transaction.
     tx.commit().await?;
 
+    // Extract the `data` field (`row_to_json` result) for each deleted row and
+    // return them as a JSON array.
     let mut out = Vec::with_capacity(rows.len());
     for r in rows {
         let v: Value = r.get::<Value, _>("data");

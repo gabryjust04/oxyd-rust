@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
-    routing::{get, post, patch, delete},
+    routing::{delete, get, patch, post},
     Json,
     Router,
 };
@@ -19,30 +19,31 @@ use crate::{
     },
 };
 
+use super::delete::delete_rows;
+use super::insert::insert_rows;
 use super::query::parse_query_options;
 use super::registry::ensure_exposed;
 use super::select::select_rows;
 use super::types::QueryOptions;
-use super::insert::insert_rows;
 use super::update::update_rows;
-use super::delete::delete_rows;
 
-/// Monta le rotte del CRUD virtuale (SELECT + INSERT + UPDATE + DELETE).
+/// Mounts the "virtual CRUD" (SELECT + INSERT + UPDATE + DELETE) routes.
 ///
-/// Esempi:
+/// Supported patterns:
+///
 ///   GET     /api/posts
 ///   GET     /api/posts?select=id,title&order=created_at.desc&limit=50
 ///   GET     /api/posts?id=eq.42
 ///
 ///   POST    /api/posts
-///     body = { ... }              → singolo insert
+///     body = { ... }              → single insert
 ///     body = [ {...}, {...} ]     → bulk insert
 ///
 ///   PATCH   /api/posts?id=eq.42
-///     body = { title: "new title", ... } → update parziale con filtri
+///     body = { title: "new title", ... } → partial update with filters
 ///
 ///   DELETE  /api/posts?id=eq.42
-///     → delete con filtri obbligatori (no mass delete)
+///     → delete with mandatory filters (no "mass delete" without WHERE)
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route(
@@ -52,24 +53,33 @@ pub fn router(state: AppState) -> Router {
                 .patch(update_handler)
                 .delete(delete_handler),
         )
+        // Store shared application state in the router so every handler can access it.
         .with_state(state)
 }
 
-/// Handler lista/selezione righe.
+/// List / select handler.
 ///
-/// - legge sempre i metadati al volo
-/// - verifica esposizione via `_oxyd_tables` (se presente)
-/// - se `require_auth = true` e `user` è None → 401
+/// Responsibilities:
+/// - Load table metadata on every request.
+/// - Check if the table is exposed via `_oxyd_tables` (if present).
+/// - Enforce authentication if `require_auth = true`.
+/// - Parse query string into [`QueryOptions`] and delegate the actual SELECT
+///   to [`select_rows`].
 async fn list_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
-    Query(qs): Query<HashMap<String, String>>,
+    // Raw query string is represented as a `HashMap<key, value>`.
+    Query(query_params): Query<HashMap<String, String>>,
+    // `OptionalUser` wraps `Option<User>` so handlers can be reused for
+    // both public and authenticated endpoints.
     OptionalUser(user): OptionalUser,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Check if the table is exposed and whether it requires authentication.
     let require_auth = ensure_exposed(&state, &table)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
+    // If the table is marked as "auth-only", reject anonymous callers.
     if require_auth && user.is_none() {
         return Err((
             StatusCode::UNAUTHORIZED,
@@ -77,36 +87,44 @@ async fn list_handler(
         ));
     }
 
+    // For now we hard-code the schema; this can later be made dynamic
+    // (e.g. multi-tenant schemas, per-user schemas, etc.).
     let schema = "public";
-    let opts: QueryOptions = parse_query_options(&qs)
-        .map_err(|e| e.into_response())?;
 
+    // Convert the raw query params into strongly typed `QueryOptions`.
+    let opts: QueryOptions = parse_query_options(&query_params)
+        .map_err(|e: ApiError| e.into_response())?;
+
+    // Execute the dynamic SELECT, taking RLS and user context into account.
     let data = select_rows(&state, schema, &table, &opts, user)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     Ok(Json(data))
 }
 
-/// Handler insert (singolo o bulk).
+/// Insert handler (single or bulk).
 ///
-/// - body = { ... }              → singolo insert
-/// - body = [ {...}, {...} ]     → bulk insert
-/// - delega a `insert_rows`, che:
-///   - costruisce la INSERT dinamica
-///   - setta il contesto RLS via `set_config('app.current_user_id', $1, true)`
-///   - se la tabella ha `user_id` e c'è un utente:
-///       - forza sempre `user_id = user.id` (errore 400 se il client prova a cambiarlo)
-///   - ritorna le righe inserite come array JSON
+/// - `body = { ... }`              → single insert
+/// - `body = [ {...}, {...} ]`     → bulk insert
+///
+/// Delegates core logic to [`insert_rows`], which:
+/// - Builds the dynamic `INSERT` statement for the target table.
+/// - Sets the RLS context via `set_config('app.current_user_id', $1, true)`.
+/// - If the table has a `user_id` column and there is an authenticated user:
+///     - Always forces `user_id = user.id`.
+///     - Returns `400` if the client tries to override `user_id`.
+/// - Returns the inserted rows as a JSON array (PostgREST-style).
 async fn insert_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
     OptionalUser(user): OptionalUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
+    // Check exposure and auth requirements for the target table.
     let require_auth = ensure_exposed(&state, &table)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     if require_auth && user.is_none() {
         return Err((
@@ -117,33 +135,35 @@ async fn insert_handler(
 
     let schema = "public";
 
+    // Delegate the heavy lifting (validation, SQL generation, RLS) to `insert_rows`.
     let data = insert_rows(&state, schema, &table, &body, user)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     Ok(Json(data))
 }
 
-/// Handler update.
+/// Update handler.
 ///
-/// - body = { col1: val1, col2: val2, ... }
-/// - richiede almeno un filtro nei query param (es: `id=eq.42`)
-/// - delega a `update_rows`, che:
-///   - costruisce l'UPDATE dinamico
-///   - applica RLS via `set_config('app.current_user_id', $1, true)`
-///   - vieta update di PK
-///   - se la tabella ha `user_id` e c'è un utente autenticato:
-///       - il client NON può aggiornare `user_id` (400 se ci prova)
+/// - `body = { col1: val1, col2: val2, ... }`
+/// - Requires at least one filter in the query string (e.g. `id=eq.42`),
+///   so that we never run a "mass update" without a WHERE clause.
+/// - Delegates to [`update_rows`], which:
+///   - Builds a dynamic `UPDATE` statement.
+///   - Applies RLS by setting `app.current_user_id`.
+///   - Forbids primary key updates.
+///   - If the table has `user_id` and the caller is authenticated:
+///       - The client cannot update `user_id` (returns `400` if it tries).
 async fn update_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
-    Query(qs): Query<HashMap<String, String>>,
+    Query(query_params): Query<HashMap<String, String>>,
     OptionalUser(user): OptionalUser,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let require_auth = ensure_exposed(&state, &table)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     if require_auth && user.is_none() {
         return Err((
@@ -153,32 +173,36 @@ async fn update_handler(
     }
 
     let schema = "public";
-    let opts: QueryOptions = parse_query_options(&qs)
-        .map_err(|e| e.into_response())?;
 
+    // Decode query string (filters, ordering, pagination...) into `QueryOptions`.
+    let opts: QueryOptions = parse_query_options(&query_params)
+        .map_err(|e: ApiError| e.into_response())?;
+
+    // Delegate to the dynamic UPDATE engine.
     let data = update_rows(&state, schema, &table, &body, &opts, user)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     Ok(Json(data))
 }
 
-/// Handler delete.
+/// Delete handler.
 ///
-/// - richiede almeno un filtro (es: `id=eq.42`) → niente mass delete
-/// - delega a `delete_rows`, che:
-///   - costruisce la DELETE dinamica
-///   - applica RLS via `set_config('app.current_user_id', $1, true)` dentro transazione
-///   - ritorna le righe eliminate come array JSON (compatibile con PostgREST-style)
+/// - Requires at least one filter in the query string (e.g. `id=eq.42`);
+///   by design we never allow a "DELETE *" without any WHERE condition.
+/// - Delegates to [`delete_rows`], which:
+///   - Builds the dynamic `DELETE` statement.
+///   - Applies RLS via `set_config('app.current_user_id', $1, true)` inside a transaction.
+///   - Returns the deleted rows as a JSON array (PostgREST-style).
 async fn delete_handler(
     State(state): State<AppState>,
     Path(table): Path<String>,
-    Query(qs): Query<HashMap<String, String>>,
+    Query(query_params): Query<HashMap<String, String>>,
     OptionalUser(user): OptionalUser,
 ) -> Result<Json<Value>, (StatusCode, String)> {
     let require_auth = ensure_exposed(&state, &table)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     if require_auth && user.is_none() {
         return Err((
@@ -188,12 +212,15 @@ async fn delete_handler(
     }
 
     let schema = "public";
-    let opts: QueryOptions = parse_query_options(&qs)
-        .map_err(|e| e.into_response())?;
+
+    // `QueryOptions` is also used here so that filters, RLS and deleted rows
+    // selection stay consistent with the SELECT/UPDATE behaviour.
+    let opts: QueryOptions = parse_query_options(&query_params)
+        .map_err(|e: ApiError| e.into_response())?;
 
     let data = delete_rows(&state, schema, &table, &opts, user)
         .await
-        .map_err(|e| e.into_response())?;
+        .map_err(|e: ApiError| e.into_response())?;
 
     Ok(Json(data))
 }

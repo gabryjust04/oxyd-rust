@@ -1,40 +1,62 @@
 // oxyd-core/src/virtual_crud/registry.rs
 
-
 use sqlx::{postgres::PgRow, Row};
 
 use crate::general::errors::{ApiError, ApiResult};
-use super::types::*;
 use crate::general::types::AppState;
+use super::types::*;
 
-
-
-/// Controlla se esiste la tabella di registry `oxyd_internal._oxyd_tables`.
+/// Check if the registry table `oxyd_internal._oxyd_tables` exists.
+///
+/// This is used to distinguish:
+/// - DEV environments (no registry table → everything is exposed by default)
+/// - PROD-like environments (registry present → explicit opt-in for each table)
 async fn oxyd_tables_exists(state: &AppState) -> Result<bool, sqlx::Error> {
     let pool = &state.pool;
+
     let exists: Option<bool> = sqlx::query_scalar(
         r#"
         SELECT TRUE
         FROM information_schema.tables
-        WHERE table_schema = 'oxyd_internal' AND table_name = '_oxyd_tables'
+        WHERE table_schema = 'oxyd_internal'
+          AND table_name   = '_oxyd_tables'
         LIMIT 1
         "#,
     )
     .fetch_optional(pool)
     .await?;
+
     Ok(exists.unwrap_or(false))
 }
 
-/// Carica la config dalla `oxyd_internal._oxyd_tables`.
-/// Se la tabella registry non esiste → Ok(None) (ambiente dev: tutto esposto).
-pub async fn load_table_config(state: &AppState, table: &str) -> ApiResult<Option<OxydTableConfig>> {
+/// Load the configuration for a given table from `oxyd_internal._oxyd_tables`.
+///
+/// Behaviour:
+/// - If the registry table **does not exist** → `Ok(None)`
+///   (DEV environment: no central registry, everything is exposed by default).
+/// - If the registry table exists:
+///     - If the row is found → return `Some(OxydTableConfig)` with stored flags.
+///     - If the row is **not** found → fabricate a config that treats the table
+///       as **not exposed** (locked down by default).
+pub async fn load_table_config(
+    state: &AppState,
+    table: &str,
+) -> ApiResult<Option<OxydTableConfig>> {
     if !oxyd_tables_exists(state).await.map_err(ApiError::from)? {
+        // Registry table missing → caller will treat this as "no registry"
+        // (e.g. dev mode: expose everything).
         return Ok(None);
     }
 
     let row = sqlx::query(
         r#"
-        SELECT table_name, is_exposed, require_auth, allow_insert, allow_update, allow_delete, description
+        SELECT table_name,
+               is_exposed,
+               require_auth,
+               allow_insert,
+               allow_update,
+               allow_delete,
+               description
         FROM oxyd_internal._oxyd_tables
         WHERE table_name = $1
         "#,
@@ -44,39 +66,51 @@ pub async fn load_table_config(state: &AppState, table: &str) -> ApiResult<Optio
     .await?;
 
     if let Some(r) = row {
+        // Table is explicitly configured in the registry.
         Ok(Some(OxydTableConfig {
-            table_name: r.get("table_name"),
-            is_exposed: r.get("is_exposed"),
+            table_name:   r.get("table_name"),
+            is_exposed:   r.get("is_exposed"),
             require_auth: r.get("require_auth"),
             allow_insert: r.get("allow_insert"),
             allow_update: r.get("allow_update"),
             allow_delete: r.get("allow_delete"),
-            description: r.get::<Option<String>, _>("description"),
+            description:  r.get::<Option<String>, _>("description"),
         }))
     } else {
-        // Registry presente ma tabella non registrata → trattala come non esposta
+        // Registry exists but the table is not registered:
+        // treat it as "not exposed" and fully locked down.
         Ok(Some(OxydTableConfig {
-            table_name: table.to_string(),
-            is_exposed: false,
+            table_name:   table.to_string(),
+            is_exposed:   false,
             require_auth: true,
             allow_insert: false,
             allow_update: false,
             allow_delete: false,
-            description: None,
+            description:  None,
         }))
     }
 }
 
-
-/// Legge metadati tabella da information_schema / pg_catalog (nessuna cache).
-pub async fn load_table_meta(state: &AppState, schema: &str, table: &str) -> ApiResult<TableMeta> {
+/// Load table metadata from `information_schema` / `pg_catalog` (no caching).
+///
+/// This provides:
+/// - list of columns (`ColumnMeta`)
+/// - basic type and nullability info
+/// - primary key columns (including composite PKs)
+pub async fn load_table_meta(
+    state: &AppState,
+    schema: &str,
+    table: &str,
+) -> ApiResult<TableMeta> {
     let pool = &state.pool;
-    // Verifica esistenza tabella
+
+    // ── Check table existence first ───────────────────────────────────────────
     let exists: Option<bool> = sqlx::query_scalar(
         r#"
         SELECT TRUE
         FROM information_schema.tables
-        WHERE table_schema = $1 AND table_name = $2
+        WHERE table_schema = $1
+          AND table_name   = $2
         LIMIT 1
         "#,
     )
@@ -84,41 +118,50 @@ pub async fn load_table_meta(state: &AppState, schema: &str, table: &str) -> Api
     .bind(table)
     .fetch_optional(pool)
     .await?;
+
     if exists.is_none() {
         return Err(ApiError::NotFound(format!("table '{}' not found", table)));
     }
 
-    // Colonne
+    // ── Load column metadata ──────────────────────────────────────────────────
     let cols = sqlx::query(
         r#"
-        SELECT column_name, data_type, is_nullable, column_default
+        SELECT column_name,
+               data_type,
+               is_nullable,
+               column_default
         FROM information_schema.columns
-        WHERE table_schema = $1 AND table_name = $2
+        WHERE table_schema = $1
+          AND table_name   = $2
         ORDER BY ordinal_position
         "#,
     )
     .bind(schema)
     .bind(table)
     .map(|row: PgRow| ColumnMeta {
-        name: row.get::<String, _>("column_name"),
-        data_type: row.get::<String, _>("data_type"),
+        name:        row.get::<String, _>("column_name"),
+        data_type:   row.get::<String, _>("data_type"),
         is_nullable: row.get::<String, _>("is_nullable") == "YES",
         has_default: row.get::<Option<String>, _>("column_default").is_some(),
     })
     .fetch_all(pool)
     .await?;
 
-    // Primary key (anche composita)
+    // ── Load primary key columns (supports composite PKs) ─────────────────────
     let pk_cols = sqlx::query_scalar::<_, String>(
         r#"
         SELECT a.attname AS col
         FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
-        JOIN pg_class c ON c.oid = i.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a
+          ON a.attrelid = i.indrelid
+         AND a.attnum   = ANY(i.indkey)
+        JOIN pg_class c
+          ON c.oid = i.indrelid
+        JOIN pg_namespace n
+          ON n.oid = c.relnamespace
         WHERE i.indisprimary = TRUE
-          AND n.nspname = $1
-          AND c.relname = $2
+          AND n.nspname      = $1
+          AND c.relname      = $2
         ORDER BY a.attnum
         "#,
     )
@@ -128,24 +171,34 @@ pub async fn load_table_meta(state: &AppState, schema: &str, table: &str) -> Api
     .await?;
 
     Ok(TableMeta {
-        schema: schema.to_string(),
-        name: table.to_string(),
+        schema:      schema.to_string(),
+        name:        table.to_string(),
         primary_key: pk_cols,
-        columns: cols,
+        columns:     cols,
     })
 }
 
-/// Verifica esposizione della tabella usando `oxyd_internal._oxyd_tables`.
-/// - Se registry NON esiste → consenti.
-/// - Se esiste e la tabella non è registrata o non esposta → NotFound.
-/// - Ritorna anche il flag `require_auth` per far decidere al caller.
+/// Ensure that a table is exposed through the registry
+/// (`oxyd_internal._oxyd_tables`) and return its `require_auth` flag.
+///
+/// Semantics:
+/// - If the registry table **does not exist**:
+///     - Treat as DEV environment: the table is considered exposed and
+///       `require_auth = false`.
+/// - If the registry exists:
+///     - If the table is not exposed → return `NotFound` to hide it completely.
+///     - Otherwise → return `Ok(require_auth)`.
 pub async fn ensure_exposed(state: &AppState, table: &str) -> ApiResult<bool> {
     match load_table_config(state, table).await? {
-        None => Ok(false), // registry assente → require_auth = false (ambiente dev)
+        // Registry absent → caller should treat this as "no auth required",
+        // typically meaning "open dev mode".
+        None => Ok(false),
         Some(cfg) => {
             if !cfg.is_exposed {
+                // Table is known but deliberately not exposed → pretend it doesn't exist.
                 return Err(ApiError::NotFound(format!("table '{}' not exposed", table)));
             }
+            // Table is exposed; return whether it requires authentication.
             Ok(cfg.require_auth)
         }
     }
