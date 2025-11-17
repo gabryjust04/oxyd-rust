@@ -106,7 +106,7 @@ async fn read_json<T: serde::de::DeserializeOwned>(res: Response) -> (StatusCode
 /* -------------------------- Test cases --------------------------- */
 
 /// Full happy-path: register → /me → refresh (rotation) → /me with new access.
-#[sqlx::test(migrations = "../oxyd-core/migrations")]
+#[sqlx::test]
 async fn auth_flow_happy_path(pool: PgPool) {
     let app = build_app(pool);
 
