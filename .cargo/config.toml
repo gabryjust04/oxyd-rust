@@ -1,0 +1,8 @@
+[build]
+target-dir = "target"
+
+[term]
+color = "auto"
+
+[env]
+RUST_LOG = "info,sqlx=warn,hyper=warn"
